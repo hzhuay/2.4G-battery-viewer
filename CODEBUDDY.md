@@ -94,5 +94,6 @@ tray_app.py         托盘常驻（纯 Win32 SetTimer + NOTIFYICONDATAW，图标
 
 ## 运行时产物（均已 gitignore）
 
-`tray_config.json`（刷新间隔 / 自启开关）、`tray_pid.txt`（单实例 PID）、`*_capture.log`、`__pycache__/`。
+`tray_config.json`（刷新间隔 / 自启开关）、`tray_pid.txt`（单实例 PID）、
+`device_last.json`（三台设备的上次读数，由 `last_state.py` 统一落盘）、`*_capture.log`、`__pycache__/`。
 默认不写任何日志文件；排查托盘问题用 `python tray_app.py --debug` 前台跑。

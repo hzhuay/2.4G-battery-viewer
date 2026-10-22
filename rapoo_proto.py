@@ -57,6 +57,7 @@ _last_ts = 0.0
 
 def _remember(r: RapooReading) -> None:
     global _last, _last_ts
+    r.ts = r.ts or time.time()
     _last, _last_ts = r, time.monotonic()
 
 
@@ -77,6 +78,7 @@ class RapooReading:
     detail: str = ""
     vid_pid: str = ""
     product: str = ""
+    ts: float = 0.0              # 墙钟时间：这条读数是什么时候读到的
 
 
 def find_interfaces() -> list[hw.HidInterface]:
@@ -170,8 +172,7 @@ def read_battery(timeout: float = 6.0,
     # 没等到新包：如果是最近刚读到过，就用缓存值（鼠标不动时不该显示 "--"）
     cached = _recall()
     if cached is not None:
-        cached.detail = (f"{cached.detail} · {CACHE_TTL:.0f} 秒前的读数"
-                         f"（动一下鼠标可刷新）")
+        cached.detail = "被动状态帧（鼠标不动时用上次读数）"
         return cached
     return out
 
@@ -194,6 +195,7 @@ def read() -> "object":
     if res.signal is not None:
         bits.append(f"信号 {res.signal}")
     r.extra = " · ".join(bits)
+    r.ts = res.ts or None
     return r
 
 

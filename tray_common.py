@@ -17,7 +17,14 @@ from typing import Optional
 import win_link
 import win_shell
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def is_frozen() -> bool:
+    """是否运行在 PyInstaller 打出的 exe 里。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+# 冻结后 __file__ 指向临时解包目录，配置/图标必须落在 exe 旁边
+BASE_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if is_frozen()
+            else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, "tray_config.json")
 PID_FILE = os.path.join(BASE_DIR, "tray_pid.txt")
 
@@ -87,17 +94,21 @@ def save_config(cfg: dict) -> None:
 # 开机自启：启动文件夹里的快捷方式（.lnk），不再用注册表
 # --------------------------------------------------------------------------
 def pythonw_path() -> str:
+    if is_frozen():
+        return sys.executable
     exe = sys.executable or ""
     cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
     return cand if os.path.exists(cand) else exe
 
 
 def tray_script() -> str:
-    return os.path.join(BASE_DIR, "tray_app.py")
+    """脚本路径；冻结成 exe 后不需要脚本参数，返回空串。"""
+    return "" if is_frozen() else os.path.join(BASE_DIR, "tray_app.py")
 
 
 def autostart_command() -> str:
-    return f'"{pythonw_path()}" "{tray_script()}"'
+    script = tray_script()
+    return f'"{pythonw_path()}"' + (f' "{script}"' if script else "")
 
 
 STARTUP_LNK_NAME = "电量托盘.lnk"
@@ -205,9 +216,10 @@ def set_autostart(enabled: bool) -> bool:
     能直接看到它（名字就是 电量托盘），并且可以在那里直接启用/禁用。
     """
     if enabled:
+        script = tray_script()
         ok = win_shell.create_shortcut(
             startup_lnk(), pythonw_path(),
-            arguments=f'"{tray_script()}"',
+            arguments=f'"{script}"' if script else "",
             workdir=BASE_DIR,
             description="设备电量托盘：常驻显示 ATK 鼠标 / DARKRIM 耳机电量")
         _set_startup_approved(True)
@@ -327,8 +339,10 @@ def start_tray_app(wait_timeout: float = 6.0) -> bool:
         return True
     cleanup_zombie()
     try:
-        subprocess.Popen([pythonw_path(), os.path.join(BASE_DIR, "tray_app.py")],
-                         cwd=BASE_DIR, creationflags=0x00000008)
+        cmd = [pythonw_path()]
+        if not is_frozen():
+            cmd.append(os.path.join(BASE_DIR, "tray_app.py"))
+        subprocess.Popen(cmd, cwd=BASE_DIR, creationflags=0x00000008)
     except Exception:
         return False
     return wait_for_tray(wait_timeout)

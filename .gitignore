@@ -13,8 +13,13 @@ _hidcap.log
 # 个人设置（刷新间隔 / 开机自启开关）
 tray_config.json
 
-# 迈从最后一次电量读数（落盘缓存）
-mchose_last.json
+# 三台设备的上次读数（落盘缓存）
+device_last.json
+
+# PyInstaller 产物
+build/
+dist/
+*.spec
 
 # 编辑器 / 系统
 .vscode/

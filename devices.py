@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+import time
 from typing import Callable, Optional
 
 import edifier_proto
 import hid_win as hw
+import last_state
 
 
 # --------------------------------------------------------------------------
@@ -33,6 +35,7 @@ class Reading:
     detail: str = ""
     error: str = ""
     extra: str = ""
+    ts: Optional[float] = None      # 数据时间（墙钟）；None = 本次实时读到
 
     @property
     def ok(self) -> bool:
@@ -45,7 +48,6 @@ class DeviceProfile:
     title: str
     reader: Callable[[], Reading]
     note: str = ""
-    plate: bool = False        # 托盘图标是否带深色底板（耳机用）
 
 
 # --------------------------------------------------------------------------
@@ -98,14 +100,47 @@ def read_mchose() -> Reading:
 
 
 # --------------------------------------------------------------------------
+# 读不到时回落到上次读数
+# --------------------------------------------------------------------------
+def _cached(key: str, fn: Callable[[], Reading]) -> Callable[[], Reading]:
+    """给读取函数套一层「上次读数」缓存。
+
+    读到 → 落盘并显示实时值；
+    读不到 → 显示上次的值 + 「14:32 更新（12 分钟前）」，让用户知道这是旧数据；
+    缓存超过 24 小时 → 不算当前电量，只在报错后面注明上次读数。
+    """
+    def reader() -> Reading:
+        r = fn()
+        if r.ok:
+            if r.ts is None:
+                r.ts = time.time()
+            last_state.save(key, r.level, r.status, r.detail, r.extra, r.ts)
+            return r
+
+        hit = last_state.get(key)
+        if hit is None:
+            return r
+        if last_state.is_expired(hit["ts"]):
+            r.error = (f"{r.error} · 上次读数 {hit['level']}%"
+                       f"（{last_state.stamp_brief(hit['ts'])}）")
+            return r
+        note = last_state.stamp(hit["ts"])
+        return Reading(r.title, r.subtitle, level=hit["level"],
+                       status=hit.get("status", ""),
+                       detail=f"{hit.get('detail', '')} · {note}".strip(" ·"),
+                       extra=hit.get("extra", ""), ts=hit["ts"])
+    return reader
+
+
+# --------------------------------------------------------------------------
 # 设备表
 # --------------------------------------------------------------------------
 PROFILES: list[DeviceProfile] = [
-    DeviceProfile("edifier", "漫步者 G3 Max", read_edifier,
-                  note="杰理方案；协议来自 HECATE 官方软件日志", plate=True),
-    DeviceProfile("rapoo", "雷柏 VT3S", read_rapoo,
+    DeviceProfile("edifier", "漫步者 G3 Max", _cached("edifier", read_edifier),
+                  note="杰理方案；协议来自 HECATE 官方软件日志"),
+    DeviceProfile("rapoo", "雷柏 VT3S", _cached("rapoo", read_rapoo),
                   note="VID 24AE；被动状态帧"),
-    DeviceProfile("mchose", "迈从 K87S", read_mchose,
+    DeviceProfile("mchose", "迈从 K87S", _cached("mchose", read_mchose),
                   note="VID 3837；固件推送式"),
 ]
 

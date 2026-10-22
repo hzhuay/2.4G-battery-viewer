@@ -37,9 +37,8 @@ from ctypes import wintypes
 from typing import Optional
 
 import hid_win as hw
-import battery as bt
-import darkrim_proto as drp
 import devices
+import last_state
 import win_icon
 import tray_common as tc
 
@@ -61,6 +60,11 @@ WM_RBUTTONUP = 0x0205
 WM_APP = 0x8000
 MSG_TRAY_CALLBACK = WM_APP + 1
 MSG_REFRESH_DONE = WM_APP + 2
+
+# 右键菜单
+MF_STRING, MF_CHECKED, MF_SEPARATOR = 0x0000, 0x0008, 0x0800
+TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x0002, 0x0100
+MENU_REFRESH, MENU_PANEL, MENU_AUTOSTART, MENU_QUIT = 1, 2, 3, 4
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
@@ -145,6 +149,19 @@ USER32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
 USER32.DispatchMessageW.restype = ctypes.c_ssize_t
 USER32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
 
+USER32.CreatePopupMenu.restype = ctypes.c_void_p
+USER32.AppendMenuW.restype = wintypes.BOOL
+USER32.AppendMenuW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                               ctypes.c_size_t, wintypes.LPCWSTR]
+USER32.TrackPopupMenu.restype = ctypes.c_int
+USER32.TrackPopupMenu.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                  ctypes.c_void_p]
+USER32.DestroyMenu.restype = wintypes.BOOL
+USER32.DestroyMenu.argtypes = [ctypes.c_void_p]
+USER32.GetCursorPos.restype = wintypes.BOOL
+USER32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+
 SHELL32.Shell_NotifyIconW.restype = wintypes.BOOL
 SHELL32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
                                       ctypes.POINTER(NOTIFYICONDATAW)]
@@ -156,24 +173,27 @@ KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
                                   wintypes.LPCWSTR]
 
 TRAY_ICONS = [
-    # (uID, key, 提示名, 是否带底板) —— 由 devices.PROFILES 自动生成
-    (i + 1, p.key, p.title, p.plate)
+    # (uID, key, 提示名) —— 由 devices.PROFILES 自动生成
+    (i + 1, p.key, p.title)
     for i, p in enumerate(devices.PROFILES)
 ]
+
+
+def has_panel() -> bool:
+    """有没有可用的面板脚本（打包成 exe 后没有）。"""
+    return (not tc.is_frozen()) and os.path.exists(
+        os.path.join(BASE_DIR, "my_devices.py"))
 
 
 # --------------------------------------------------------------------------
 # 设备读取（轻量版）
 # --------------------------------------------------------------------------
-def read_device(profile) -> tuple[Optional[int], str]:
-    """按注册表读一个设备，返回 (电量, 错误说明)。"""
+def read_device(profile):
+    """按注册表读一个设备，返回 Reading（含数据时间 ts）。"""
     try:
-        r = profile.reader()
+        return profile.reader()
     except Exception as e:
-        return None, f"读取失败：{e}"
-    if r.ok:
-        return r.level, ""
-    return None, r.error or "未知"
+        return devices.Reading(profile.title, error=f"读取失败：{e}")
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +206,7 @@ class TrayApp:
         self.hwnd: Optional[int] = None
         self.wndproc_ref = None
         self.busy = False
-        self.levels = {k: (None, "正在读取…") for _, k, _, _ in TRAY_ICONS}
+        self.levels = {k: devices.Reading("", error="正在读取…") for _, k, _ in TRAY_ICONS}
         self.icons_added = False
         self.taskbar_created_msg = USER32.RegisterWindowMessageW("TaskbarCreated")
         self.msg_quit = USER32.RegisterWindowMessageW(tc.MSG_QUIT)
@@ -223,19 +243,24 @@ class TrayApp:
         nid.uCallbackMessage = MSG_TRAY_CALLBACK
         return nid
 
-    def _apply_icon(self, action: int, uID: int, key: str, title: str,
-                    plate: bool) -> bool:
-        level, err = self.levels[key]
+    def _apply_icon(self, action: int, uID: int, key: str, title: str) -> bool:
+        r = self.levels[key]
+        level = r.level
         text = str(level) if level is not None else "--"
         nid = self._nid(uID)
-        nid.hIcon = win_icon.make_hicon(text, self._color(level), plate)
-        nid.szTip = (f"{title}：{level}%（{time.strftime('%H:%M:%S')} 更新）"
-                     if level is not None else f"{title}：{err or '未知'}")
+        nid.hIcon = win_icon.make_hicon(text, self._color(level))
+        if level is not None:
+            # 显示"数据是什么时候的"，不是"刚才刷新过"
+            when = (last_state.stamp(r.ts) if r.ts
+                    else time.strftime("%H:%M:%S") + " 更新")
+            nid.szTip = f"{title}：{level}% · {when}"
+        else:
+            nid.szTip = f"{title}：{r.error or '未知'}"
         return bool(SHELL32.Shell_NotifyIconW(action, ctypes.byref(nid)))
 
     def add_icons(self) -> None:
-        for uID, key, title, plate in TRAY_ICONS:
-            ok = self._apply_icon(NIM_ADD, uID, key, title, plate)
+        for uID, key, title in TRAY_ICONS:
+            ok = self._apply_icon(NIM_ADD, uID, key, title)
             self.log(f"NIM_ADD {title} -> {'ok' if ok else '失败'}")
         self.icons_added = True
 
@@ -243,11 +268,11 @@ class TrayApp:
         if not self.icons_added:
             self.add_icons()
             return
-        for uID, key, title, plate in TRAY_ICONS:
-            self._apply_icon(NIM_MODIFY, uID, key, title, plate)
+        for uID, key, title in TRAY_ICONS:
+            self._apply_icon(NIM_MODIFY, uID, key, title)
 
     def remove_icons(self) -> None:
-        for uID, _, _, _ in TRAY_ICONS:
+        for uID, _, _ in TRAY_ICONS:
             nid = self._nid(uID)
             nid.uFlags = 0
             SHELL32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
@@ -297,12 +322,59 @@ class TrayApp:
     def on_refresh_done(self) -> None:
         self.busy = False
         for p in devices.PROFILES:
-            level, err = self.levels[p.key]
-            self.log(f"刷新完成：{p.title}={level}（{err or 'ok'}）")
+            r = self.levels[p.key]
+            self.log(f"刷新完成：{p.title}={r.level}（{r.error or 'ok'}）")
         self.update_icons()
+
+    # ---- 右键菜单 -------------------------------------------------------
+    def show_menu(self) -> None:
+        """右键菜单：刷新 / 打开面板（有脚本时才有）/ 开机自启 / 退出。
+
+        打包成 exe 后没有面板脚本，"打开面板"会自动隐藏，退出走这里。
+        """
+        if not self.hwnd:
+            return
+        menu = USER32.CreatePopupMenu()
+        if not menu:
+            return
+        cmd = 0
+        try:
+            USER32.AppendMenuW(menu, MF_STRING, MENU_REFRESH, "立即刷新")
+            if has_panel():
+                USER32.AppendMenuW(menu, MF_STRING, MENU_PANEL, "打开面板")
+            USER32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            flag = MF_STRING | (MF_CHECKED if tc.is_autostart_enabled() else 0)
+            USER32.AppendMenuW(menu, flag, MENU_AUTOSTART, "开机自启")
+            USER32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            USER32.AppendMenuW(menu, MF_STRING, MENU_QUIT, "退出")
+
+            pt = wintypes.POINT()
+            USER32.GetCursorPos(ctypes.byref(pt))
+            # 弹菜单前必须先抢前台，否则点菜单外面它不会消失
+            USER32.SetForegroundWindow(self.hwnd)
+            cmd = USER32.TrackPopupMenu(
+                menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                pt.x, pt.y, 0, self.hwnd, None)
+            USER32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
+        finally:
+            USER32.DestroyMenu(menu)
+
+        if cmd == MENU_REFRESH:
+            self.refresh_now()
+        elif cmd == MENU_PANEL:
+            self.open_ui()
+        elif cmd == MENU_AUTOSTART:
+            ok = tc.set_autostart(not tc.is_autostart_enabled())
+            self.cfg["autostart"] = tc.is_autostart_enabled()
+            tc.save_config(self.cfg)
+            self.log(f"开机自启 -> {self.cfg['autostart']}（{'成功' if ok else '失败'}）")
+        elif cmd == MENU_QUIT:
+            self.quit()
 
     # ---- 打开简洁界面 ---------------------------------------------------
     def open_ui(self) -> None:
+        if not has_panel():
+            return
         hwnd = tc.ui_hwnd()
         if hwnd:
             USER32.ShowWindow(hwnd, SW_RESTORE)
@@ -335,7 +407,7 @@ class TrayApp:
         if msg == MSG_TRAY_CALLBACK:
             event = int(lparam) & 0xFFFF
             if event == WM_RBUTTONUP:
-                self.open_ui()                     # 右键：直接打开界面
+                self.show_menu()                   # 右键：菜单
             elif event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
                 self.refresh_now()                 # 左键：立刻刷新
             return 0
@@ -399,6 +471,12 @@ class TrayApp:
 
 
 def main() -> int:
+    # 打包成 windowed exe 后控制台默认按 GBK 输出，--status 会花屏
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(description="托盘电量监视器")
     parser.add_argument("--debug", action="store_true", help="前台运行并输出日志")
     parser.add_argument("--status", action="store_true", help="打印当前状态")

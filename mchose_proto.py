@@ -42,8 +42,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -60,9 +58,6 @@ AT_BATTERY_CMD = 0x07        # FA FB 07 <电量%> <充电>
 AT_COMMS_CMD = 0x06         # FA FB 06 <0=断开 1=连上>
 
 CACHE_TTL = 3600.0
-# 最后一次读数落盘：进程重启后还能显示「N 分钟前」的值（官方驱动也是这么做的）
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "mchose_last.json")
 
 
 @dataclass
@@ -74,52 +69,20 @@ class MchoseReading:
     raw: bytes = b""
     detail: str = ""
     vid_pid: str = ""
-    ts: float = 0.0
+    ts: float = 0.0          # monotonic，仅用于内存缓存的时效判断
+    wall: float = 0.0        # 墙钟时间，给界面显示「几点更新」
 
 
 _last: Optional[MchoseReading] = None
-_last_wall = 0.0             # 写盘用的墙钟时间（monotonic 不能跨进程）
 _lock = threading.Lock()
 
 
 def _remember(r: MchoseReading) -> None:
-    global _last, _last_wall
+    """只缓存到内存；落盘交给 devices.py 的公共缓存层。"""
+    global _last
+    r.wall = time.time()
     with _lock:
         _last = r
-        _last_wall = time.time()
-        try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"battery": r.battery,
-                           "charging": bool(r.charging),
-                           "vid_pid": r.vid_pid,
-                           "ts": _last_wall}, f)
-        except OSError:
-            pass
-
-
-def _load_disk() -> Optional[MchoseReading]:
-    """把上次落盘的读数读回内存（只读一次，失败就当没有）。"""
-    global _last_wall
-    try:
-        with open(CACHE_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        level = int(d["battery"])
-        wall = float(d["ts"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    if not 0 <= level <= 100 or wall <= 0:
-        return None
-    _last_wall = wall
-    return MchoseReading(online=True, battery=level,
-                         charging=bool(d.get("charging")),
-                         vid_pid=str(d.get("vid_pid") or ""),
-                         detail="设备推送 FA FB 07", ts=time.monotonic())
-
-
-def _age_minutes() -> int:
-    if _last_wall <= 0:
-        return 0
-    return max(0, int((time.time() - _last_wall) / 60))
 
 
 def _recall(max_age: float = CACHE_TTL) -> Optional[MchoseReading]:
@@ -229,23 +192,12 @@ def read(wait: float = 4.0) -> "object":
         return r
 
     cached = _recall()
-    if cached is None:
-        cached = _load_disk()
-
     if cached is not None and cached.battery is not None:
-        age = _age_minutes()
-        if age * 60 > CACHE_TTL:
-            # 太久以前的读数就不当"当前电量"用了，但把上次值如实说出来
-            hours = age / 60
-            r.error = (f"设备在线，但没收到电量推送（上次读数 {cached.battery}%，"
-                       f"{hours:.0f} 小时前；插拔充电线可刷新）")
-            return r
         r.level = cached.battery
         r.status = "充电中" if cached.charging else "放电中"
         r.detail = cached.detail
-        if age >= 1:
-            r.detail = f"{cached.detail} · {age} 分钟前的读数"
         r.extra = "插拔充电线可刷新"
+        r.ts = cached.wall or time.time()
         return r
 
     deadline = time.monotonic() + max(wait, 0.5)
@@ -256,6 +208,7 @@ def read(wait: float = 4.0) -> "object":
             r.status = "充电中" if cur.charging else "放电中"
             r.detail = cur.detail
             r.extra = cur.vid_pid
+            r.ts = cur.wall or time.time()
             return r
         time.sleep(0.2)
 

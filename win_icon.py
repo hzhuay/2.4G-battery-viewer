@@ -33,21 +33,24 @@ DIGITS = {
 GLYPH_W, GLYPH_H = 3, 5
 
 
-def render_rgba(text: str, size: int, color: tuple[int, int, int],
-                plate: bool = False, plate_color=(28, 30, 34, 235)) -> bytes:
-    """把文字渲染成 size×size 的 RGBA 像素（返回 size*size*4 字节，行优先）。"""
-    n = len(text)
-    # 选一个能放下的最大缩放倍数
-    gap = 1
-    scale = 1
-    while True:
-        w = n * GLYPH_W * (scale + 1) + (n - 1) * gap
-        h = GLYPH_H * (scale + 1)
-        if w > size - 2 or h > size - 2:
-            break
-        scale += 1
+def render_rgba(text: str, size: int, color: tuple[int, int, int]) -> bytes:
+    """把文字渲染成 size×size 的 RGBA 像素（返回 size*size*4 字节，行优先）。
 
-    gw, gh = GLYPH_W * scale, GLYPH_H * scale
+    关键点：**横向缩放和纵向缩放分开算**。
+    三位数（100）如果等比例缩放会被压得很小，所以允许纵向拉高到与两位数齐平，
+    代价只是数字看起来略瘦——比"变小一半"好看得多。
+    """
+    n = len(text)
+    avail_w, avail_h = size - 2, size - 2
+    gap = 1 if size >= 20 else 0
+
+    sy = max(1, avail_h // GLYPH_H)                    # 纵向能放多大
+    sx = max(1, (avail_w - (n - 1) * gap) // (GLYPH_W * n))   # 横向能放多大
+    sx = min(sx, sy)
+    # 避免拉得太夸张（比例超过 1.6 会变成"瘦高条"）
+    sy = min(sy, max(sx, int(round(sx * 1.6))))
+
+    gw, gh = GLYPH_W * sx, GLYPH_H * sy
     total_w = n * gw + (n - 1) * gap
     total_h = gh
     ox = (size - total_w) // 2
@@ -64,17 +67,6 @@ def render_rgba(text: str, size: int, color: tuple[int, int, int],
         i = (y * size + x) * 4
         return (px[i], px[i + 1], px[i + 2], px[i + 3])
 
-    # 底衬（耳机图标用，跟鼠标图标区分开）
-    if plate:
-        r = max(1, size // 8)
-        for y in range(size):
-            for x in range(size):
-                # 圆角矩形
-                cx = min(x, size - 1 - x)
-                cy = min(y, size - 1 - y)
-                if cx + cy < r and cx < r and cy < r:
-                    continue
-                put(x, y, plate_color)
 
     # 逐字画
     for k, ch in enumerate(text):
@@ -86,9 +78,9 @@ def render_rgba(text: str, size: int, color: tuple[int, int, int],
             for gxx, bit in enumerate(row):
                 if bit != "1":
                     continue
-                for dy in range(scale):
-                    for dx in range(scale):
-                        put(gx + gxx * scale + dx, oy + gy * scale + dy,
+                for dy in range(sy):
+                    for dx in range(sx):
+                        put(gx + gxx * sx + dx, oy + gy * sy + dy,
                             (*color, 255))
 
     # 描一圈深色轮廓，保证在浅色/深色任务栏上都看得清
@@ -151,7 +143,22 @@ user32.LoadImageW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.UINT,
 user32.DestroyIcon.restype = wintypes.BOOL
 user32.DestroyIcon.argtypes = [ctypes.c_void_p]
 
-SIZES = (16, 24, 32)
+SIZES = (16, 20, 24, 32, 48)
+
+SM_CXSMICON = 49
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+
+
+def system_icon_size() -> int:
+    """任务栏通知区当前用的图标像素尺寸（随 DPI 变化：16/20/24/32…）。"""
+    try:
+        s = user32.GetSystemMetrics(SM_CXSMICON)
+        if 12 <= s <= 64:
+            return s
+    except Exception:
+        pass
+    return 16
 _icon_cache: dict[tuple, int] = {}
 _tmp_dir: Optional[str] = None
 
@@ -164,21 +171,24 @@ def _ensure_tmp() -> str:
     return _tmp_dir
 
 
-def make_hicon(text: str, color: tuple[int, int, int], plate: bool = False) -> int:
+def make_hicon(text: str, color: tuple[int, int, int]) -> int:
     """按文字+颜色生成（带缓存的）HICON；失败返回 0。"""
-    key = (text, color, plate)
+    target = system_icon_size()
+    key = (text, color, target)
     if key in _icon_cache:
         return _icon_cache[key]
-    images = [(s, render_rgba(text, s, color, plate)) for s in SIZES]
+    sizes = sorted(set(SIZES) | {target})
+    images = [(s, render_rgba(text, s, color)) for s in sizes]
     ico = build_ico(images)
     path = os.path.join(_ensure_tmp(), f"ico_{text}_{color[0]:02x}{color[1]:02x}"
-                                       f"{color[2]:02x}_{int(plate)}.ico")
+                                       f"{color[2]:02x}_{target}.ico")
     try:
         with open(path, "wb") as f:
             f.write(ico)
     except OSError:
         return 0
-    h = user32.LoadImageW(None, path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
+    # 明确要 target 尺寸，否则 Windows 会拿小图放大，字就糊成一团
+    h = user32.LoadImageW(None, path, IMAGE_ICON, target, target, LR_LOADFROMFILE)
     hicon = int(h) if h else 0
     _icon_cache[key] = hicon
     return hicon
@@ -209,14 +219,14 @@ if __name__ == "__main__":
     # 生成几个样例，方便肉眼检查
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_icon_preview")
     os.makedirs(out, exist_ok=True)
-    for text, color, plate, name in (
-        ("82", (93, 220, 138), False, "mouse82"),
-        ("70", (93, 220, 138), True, "headset70"),
-        ("9", (255, 107, 107), False, "mouse9"),
-        ("100", (245, 196, 81), True, "headset100"),
-        ("25", (245, 196, 81), False, "mouse25"),
+    for text, color, name in (
+        ("82", (93, 220, 138), "mouse82"),
+        ("70", (93, 220, 138), "headset70"),
+        ("9", (255, 107, 107), "mouse9"),
+        ("100", (245, 196, 81), "headset100"),
+        ("25", (245, 196, 81), "mouse25"),
     ):
-        imgs = [(s, render_rgba(text, s, color, plate)) for s in SIZES]
+        imgs = [(s, render_rgba(text, s, color)) for s in SIZES]
         p = os.path.join(out, name + ".ico")
         with open(p, "wb") as f:
             f.write(build_ico(imgs))
