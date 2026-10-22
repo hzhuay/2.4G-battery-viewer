@@ -1,21 +1,31 @@
-# 设备电量查看器（雷柏 / 迈从 / 漫步者）
+# 2.4G 外设电量查看器（漫步者 / 雷柏 / 迈从）
 
-Windows 上读取 2.4G 无线外设电量的小工具。**纯 ctypes 调系统 DLL，零第三方依赖**——
-不用 hidapi、不用 pystray、不用 Pillow、不用 pywin32，装了 Python 就能跑。
+Windows 10/11 上读取 **2.4G 无线耳机 / 鼠标 / 键盘电量**的桌面小工具：
+右下角托盘常驻数字图标，另有一个可选的简洁面板。
+**纯 ctypes 调系统 DLL，零第三方依赖**——不用 hidapi / pystray / Pillow / pywin32，
+装了 Python 就能跑，也可以打包成单个 exe（目标机无需 Python）。
 
 这是 [yszyszysz233/2.4G-battery-viewer](https://github.com/yszyszysz233/2.4G-battery-viewer) 的 fork，
-原项目针对作者的 ATK 鼠标 + DARKRIM 耳机；这里换成了自己的三台设备，并把「设备写死」的
-上层改成了**配置驱动**。
+原项目针对 ATK 鼠标 + DARKRIM 耳机；本项目换成自己的三台设备，并把「设备写死」的上层改成了**配置驱动**。
 
 ## 支持的设备
 
-| 设备 | VID:PID | 怎么读 |
-|---|---|---|
-| **漫步者 HECATE G3 Max** | `35BB:A226` | 杰理方案。厂商集合 `0xFF02:0x0002`，**输出报告 ID `0xD0`**；发 `35 BB 01 00` 问状态，回 `35 BB 0A 00 01 <电量%> <充电标志>` |
-| **雷柏 VT3S** | `24AE:1411` | 厂商集合 `0xFF00:0x0002`，**被动**上报 19 字节状态帧，**第 8 字节是电量**（附带 DPI、信号强度） |
-| **迈从 K87S** | `3837:3033` | 命令通道 `0x0001:0x0000`，**固件主动推送** `FA FB 07 <电量%> <充电标志>` / MANUAL_REPORT / baseInfo。⚠️ 这个接收器**不回应任何查询**（官方格式的 getInfo/getBase/getBattery 累计发了 500+ 帧，`HidD_SetOutputReport` 和 `WriteFile` 两种写法都试过，零回复），所以只能常驻监听接推送；插拔充电线能立刻触发一次，读数缓存 1 小时 |
+只支持**下面这三台具体型号**——协议是逐台逆向出来的，不是通用 HID 电量，换别的设备不会自动识别。
 
-三台的协议来源都写在各自的 `*_proto.py` 文件头注释里。
+| 设备 | VID:PID | 类型 | 读取方式 | 实时性 |
+|---|---|---|---|---|
+| **漫步者 HECATE G3 Max** | `35BB:A226` | 2.4G 耳机 | 主动查询：厂商集合 `0xFF02:0x0002`，RID `0xD0`，发 `35 BB 01 00`，回 `35 BB 0A 00 01 <电量%> <充电>` | ✅ 每次刷新实时 |
+| **雷柏 VT3S** | `24AE:1411` | 2.4G 鼠标 | 纯被动：厂商集合 `0xFF00` 的 19 字节状态帧，第 8 字节电量，附带 DPI / 信号强度 | ⚠️ 鼠标有动作才上报，缓存 5 分钟 |
+| **迈从 K87S** | `3837:3033` | 2.4G 键盘 | 只收推送：`0x0001:0x0000` 通道上的 `FA FB 07 <电量%> <充电>` | ⚠️ **固件不回应任何查询**，只能靠固件在充电/断电时主动播报；插拔一次充电线即可触发 |
+
+> 迈从的查询已经彻底排除：官方格式的 getInfo / getBase / getBattery 累计发了 500+ 帧，
+> `HidD_SetOutputReport` 与 `WriteFile` 两种写法都试过，Feature Report 也不存在，全部零回复。
+> 官方网页驱动/桌面 HUB 同样从不查询——它们显示的其实是缓存下来的旧值。
+
+三台的协议来源与实测记录写在各自的 `*_proto.py` 文件头和 `HANDOVER.md` 里。
+
+**读不到时不会显示猜的数字**：三台设备都会记住最后一次成功读数，显示成
+「68% · 01:36 更新（45 分钟前）」；超过 24 小时的读数只写进报错，不再当作当前电量。
 
 ## 使用方法
 
@@ -46,15 +56,18 @@ dist\电量托盘.exe             # 直接双击运行，右下角出现电量�
 
 ```
 hid_win.py        ctypes 实现的 Windows HID 访问层（枚举 / Feature Report / 异步 Input Report / 能力表）
-battery.py        多策略电量读取 + 厂商协议表（通用框架）
 devices.py        ★ 设备注册表：加设备 = 加一条 profile，界面和托盘自动跟着变
+last_state.py     三台共用的「上次读数」落盘缓存（device_last.json）
 edifier_proto.py  漫步者 G3 Max（杰理私有协议）
 rapoo_proto.py    雷柏（被动状态帧）
-mchose_proto.py   迈从（固件推送）
-bt_battery.py     蓝牙耳机 HFP 电量
-my_devices.py     简洁面板
-tray_app.py       托盘常驻（图标数量由注册表决定）
+mchose_proto.py   迈从（固件推送，只读监听）
+my_devices.py     简洁面板（tkinter）
+tray_app.py       托盘常驻（纯 Win32，图标数量由注册表决定）
+tray_common.py    配置 / 单实例 / 开机自启 / 桌面链接
+win_icon.py       运行时用 GDI 画数字图标
+build.bat         PyInstaller 单文件打包（只打托盘）
 tools/            逆向过程用的一次性探测脚本
+battery.py / darkrim_proto.py / bt_battery.py / app.py   上游 fork 遗留，不在当前读取链路里
 ```
 
 ## 逆向这几个协议时踩到的坑
