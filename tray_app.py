@@ -39,6 +39,7 @@ from typing import Optional
 import hid_win as hw
 import battery as bt
 import darkrim_proto as drp
+import devices
 import win_icon
 import tray_common as tc
 
@@ -155,40 +156,24 @@ KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
                                   wintypes.LPCWSTR]
 
 TRAY_ICONS = [
-    # (uID, key, 提示名, 是否带底板)
-    (1, "mouse", "ATK 鼠标", False),
-    (2, "headset", "DARKRIM 耳机", True),
+    # (uID, key, 提示名, 是否带底板) —— 由 devices.PROFILES 自动生成
+    (i + 1, p.key, p.title, p.plate)
+    for i, p in enumerate(devices.PROFILES)
 ]
 
 
 # --------------------------------------------------------------------------
 # 设备读取（轻量版）
 # --------------------------------------------------------------------------
-def _find_iface(vid: int, usage_page: int, output_len: int = 0):
-    for d in hw.enumerate_hid():
-        if d.vid == vid and d.usage_page == usage_page:
-            if not output_len or d.output_len == output_len:
-                return d
-    return None
-
-
-def read_mouse() -> tuple[Optional[int], str]:
-    iface = _find_iface(0x373B, 0xFF05, 64) or _find_iface(0x373B, 0xFF02)
-    if iface is None:
-        return None, "没找到接收器"
+def read_device(profile) -> tuple[Optional[int], str]:
+    """按注册表读一个设备，返回 (电量, 错误说明)。"""
     try:
-        res = bt.strategy_vendor_protocol(iface)
+        r = profile.reader()
     except Exception as e:
         return None, f"读取失败：{e}"
-    if res is None:
-        return None, "没有可用的读取方式"
-    if res.ok:
-        return res.level, ""
-    return None, res.detail or "无回复（动一下鼠标）"
-
-
-def read_headset() -> tuple[Optional[int], str]:
-    return drp.read_battery_only(timeout=0.4)
+    if r.ok:
+        return r.level, ""
+    return None, r.error or "未知"
 
 
 # --------------------------------------------------------------------------
@@ -303,16 +288,17 @@ class TrayApp:
 
     def _worker(self, hwnd: int) -> None:
         try:
-            self.levels["mouse"] = read_mouse()
-            self.levels["headset"] = read_headset()
+            for p in devices.PROFILES:
+                self.levels[p.key] = read_device(p)
         except Exception:
             self.log("读取异常:\n" + traceback.format_exc())
         USER32.PostMessageW(hwnd, MSG_REFRESH_DONE, 0, 0)
 
     def on_refresh_done(self) -> None:
         self.busy = False
-        m, h = self.levels["mouse"], self.levels["headset"]
-        self.log(f"刷新完成：鼠标={m[0]}（{m[1] or 'ok'}） 耳机={h[0]}（{h[1] or 'ok'}）")
+        for p in devices.PROFILES:
+            level, err = self.levels[p.key]
+            self.log(f"刷新完成：{p.title}={level}（{err or 'ok'}）")
         self.update_icons()
 
     # ---- 打开简洁界面 ---------------------------------------------------

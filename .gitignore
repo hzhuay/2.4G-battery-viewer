@@ -8,6 +8,7 @@ tray_pid.txt
 tray_debug.log
 _dbg*.txt
 _hidcap.log
+*_capture.log
 
 # 个人设置（刷新间隔 / 开机自启开关）
 tray_config.json
