@@ -33,11 +33,17 @@
   ``FA FB 07`` 且 t[4]==0 → "stopCharging" + updateBattery{battery: t[3]}``。
 * **回复是异步的**：查询包发出去后，设备过一会儿才用 AT 帧推回来，不是一问一答。
 
-所以读取方式是：常驻监听 + 缓存；读的时候再补发一次 getBattery 查询刺激设备推一次。
+所以读取方式只能是：常驻监听 + 缓存，**一个字节都不发**。
+最后一次读数会落盘到 ``mchose_last.json``（带时间戳），进程重启后仍能显示「N 分钟前的读数」；
+超过 ``CACHE_TTL`` 就当过期，如实报错但把上次值写在提示里。
+官方网页驱动同样只监听——它的 refreshChargingStatus() 是空实现，从不发查询；
+本机实测 class P getInfo 与 class J getBattery 全部零回包（见 HANDOVER.md §4.3）。
 """
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -47,25 +53,16 @@ import hid_win as hw
 from hid_win import HidDevice, HidError
 
 VID = 0x3837                 # 迈从 MCHOSE
-CHANNEL = (0x0001, 0x0000)   # usage page / usage —— Qhw 命令通道
-REPORT_LEN = 65             # 这台接收器的输出报告长度
-
-# ---- 官方 Qhw 协议参数（class J）----
-QHW_REPORT_ID = 0x00         # Windows 侧这个集合只有 RID 0x00
-QHW_VERSION = 1
-QHW_FLAGS = 3
-QHW_BIZ = 0
-
-CMD_GET_BASE_INFO = 2304
-CMD_GET_FW_VERSION = 2305
-CMD_GET_BATTERY = 2308
+CHANNEL = (0x0001, 0x0000)   # usage page / usage —— 设备推送 AT 帧的通道
 
 # AT 帧（设备 → 主机）
 AT_BATTERY_CMD = 0x07        # FA FB 07 <电量%> <充电>
 AT_COMMS_CMD = 0x06         # FA FB 06 <0=断开 1=连上>
 
 CACHE_TTL = 3600.0
-QUERY_INTERVAL = 30.0       # 常驻线程每隔多久补发一次查询
+# 最后一次读数落盘：进程重启后还能显示「N 分钟前」的值（官方驱动也是这么做的）
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "mchose_last.json")
 
 
 @dataclass
@@ -81,13 +78,48 @@ class MchoseReading:
 
 
 _last: Optional[MchoseReading] = None
+_last_wall = 0.0             # 写盘用的墙钟时间（monotonic 不能跨进程）
 _lock = threading.Lock()
 
 
 def _remember(r: MchoseReading) -> None:
-    global _last
+    global _last, _last_wall
     with _lock:
         _last = r
+        _last_wall = time.time()
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"battery": r.battery,
+                           "charging": bool(r.charging),
+                           "vid_pid": r.vid_pid,
+                           "ts": _last_wall}, f)
+        except OSError:
+            pass
+
+
+def _load_disk() -> Optional[MchoseReading]:
+    """把上次落盘的读数读回内存（只读一次，失败就当没有）。"""
+    global _last_wall
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        level = int(d["battery"])
+        wall = float(d["ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not 0 <= level <= 100 or wall <= 0:
+        return None
+    _last_wall = wall
+    return MchoseReading(online=True, battery=level,
+                         charging=bool(d.get("charging")),
+                         vid_pid=str(d.get("vid_pid") or ""),
+                         detail="设备推送 FA FB 07", ts=time.monotonic())
+
+
+def _age_minutes() -> int:
+    if _last_wall <= 0:
+        return 0
+    return max(0, int((time.time() - _last_wall) / 60))
 
 
 def _recall(max_age: float = CACHE_TTL) -> Optional[MchoseReading]:
@@ -99,33 +131,10 @@ def _recall(max_age: float = CACHE_TTL) -> Optional[MchoseReading]:
 
 
 # --------------------------------------------------------------------------
-# 组帧 / 解析
+# 解析
 # --------------------------------------------------------------------------
-def build_qhw(command: int, payload: bytes = b"", seq: int = 0) -> bytes:
-    """官方 class J 的协议帧（**不含**报告 ID）。
-
-    线上 = [RID] + version, flags, length, cmdLo, cmdHi, biz, seq, payload…, cs
-    """
-    header = [QHW_VERSION, QHW_FLAGS, len(payload),
-              command & 0xFF, (command >> 8) & 0xFF, QHW_BIZ, seq & 0xFF]
-    body = header + list(payload)
-    cs = 0
-    for b in body[1:]:
-        cs ^= b
-    return bytes(body + [cs])
-
-
-def build_output(frame: bytes, report_id: int = QHW_REPORT_ID,
-                 length: int = REPORT_LEN) -> bytes:
-    """拼 Windows 的输出报告缓冲：第 0 字节是报告 ID，后面补零到报告长度。"""
-    payload = bytes([report_id]) + frame
-    if len(payload) < length:
-        payload += bytes(length - len(payload))
-    return payload
-
-
 def find_interface() -> Optional[hw.HidInterface]:
-    """Qhw 命令通道：usage page 0x0001 / usage 0x0000。"""
+    """设备推送 AT 帧的通道：usage page 0x0001 / usage 0x0000。"""
     for d in hw.enumerate_hid():
         if (d.vid == VID and d.usage_page == CHANNEL[0] and d.usage == CHANNEL[1]
                 and d.output_len and not d.reserved):
@@ -158,38 +167,16 @@ def parse_at(raw: bytes) -> Optional[MchoseReading]:
 # --------------------------------------------------------------------------
 _listener_thread: Optional[threading.Thread] = None
 _listener_lock = threading.Lock()
-_seq = [0]
-
-
-def _next_seq() -> int:
-    _seq[0] = (_seq[0] + 1) & 0xFF
-    return _seq[0]
-
-
-def _send_query(dev: HidDevice, command: int = CMD_GET_BATTERY,
-                payload: bytes = b"") -> bool:
-    frame = build_qhw(command, payload, seq=_next_seq())
-    buf = build_output(frame, length=dev.caps.OutputReportByteLength or REPORT_LEN)
-    try:
-        dev.write_output(buf)
-        return True
-    except HidError:
-        return False
 
 
 def _listener_loop(iface: hw.HidInterface) -> None:
-    """常驻：收 AT 帧 + 定时补发查询。"""
+    """常驻被动监听：只收 AT 帧，一个字节都不发。"""
     try:
-        dev = HidDevice(iface.path, write=True)
+        dev = HidDevice(iface.path, write=False)
     except HidError:
         return
-    last_query = 0.0
     try:
         while True:
-            now = time.monotonic()
-            if now - last_query > QUERY_INTERVAL:
-                last_query = now
-                _send_query(dev)
             data = dev.read_input(timeout_ms=250)
             if not data:
                 continue
@@ -229,9 +216,10 @@ def start_listener() -> bool:
 # 对外接口（devices.py 注册表用）
 # --------------------------------------------------------------------------
 def read(wait: float = 4.0) -> "object":
-    """给 devices.py 注册表用的入口。
+    """给 devices.py 注册表用的入口（只读，不发包）。
 
-    常驻线程负责收；这里补发一次 getBattery 查询，催设备推一次。
+    有缓存就直接用——推送只在充电/断电时来，干等没有意义；
+    从来没读到过时才等 ``wait`` 秒，看能不能正好赶上一次推送。
     """
     from devices import Reading
 
@@ -240,19 +228,27 @@ def read(wait: float = 4.0) -> "object":
         r.error = "没找到迈从接收器命令通道（VID 3837 / usage 0x0001:0x0000）"
         return r
 
-    deadline = time.monotonic() + max(wait, 0.5)
-    # 先等缓存里有没有（上次推过的值）
     cached = _recall()
-    if cached is not None and cached.battery is not None:
-        # 再补发一次查询，等更新的值
-        iface = find_interface()
-        if iface is not None:
-            try:
-                with HidDevice(iface.path, write=True) as wdev:
-                    _send_query(wdev)
-            except HidError:
-                pass
+    if cached is None:
+        cached = _load_disk()
 
+    if cached is not None and cached.battery is not None:
+        age = _age_minutes()
+        if age * 60 > CACHE_TTL:
+            # 太久以前的读数就不当"当前电量"用了，但把上次值如实说出来
+            hours = age / 60
+            r.error = (f"设备在线，但没收到电量推送（上次读数 {cached.battery}%，"
+                       f"{hours:.0f} 小时前；插拔充电线可刷新）")
+            return r
+        r.level = cached.battery
+        r.status = "充电中" if cached.charging else "放电中"
+        r.detail = cached.detail
+        if age >= 1:
+            r.detail = f"{cached.detail} · {age} 分钟前的读数"
+        r.extra = "插拔充电线可刷新"
+        return r
+
+    deadline = time.monotonic() + max(wait, 0.5)
     while time.monotonic() < deadline:
         cur = _recall()
         if cur is not None and cur.battery is not None:
@@ -263,15 +259,8 @@ def read(wait: float = 4.0) -> "object":
             return r
         time.sleep(0.2)
 
-    if cached is not None and cached.battery is not None:
-        r.level = cached.battery
-        r.status = "充电中" if cached.charging else "放电中"
-        r.detail = f"{cached.detail}（{int((time.monotonic() - cached.ts) / 60)} 分钟前的读数）"
-        r.extra = cached.vid_pid
-        return r
-
-    r.error = ("设备在线，但没收到电量推送"
-               "（迈从键盘只在充电/断电时广播 FA FB 07，"
+    r.error = ("设备在线，但还没收到过电量推送"
+               "（键盘只在充电/断电时广播 FA FB 07，"
                "插拔一下充电线即可触发）")
     return r
 
@@ -285,7 +274,6 @@ if __name__ == "__main__":
     it = find_interface()
     print("命令通道：", f"{it.vid_pid} 0x{it.usage_page:04X}:0x{it.usage:04X} "
                         f"in={it.input_len} out={it.output_len}" if it else "没找到")
-    print("getBattery 查询包:", build_output(build_qhw(CMD_GET_BATTERY, seq=1)).hex(" "))
     start_listener()
     t0 = time.monotonic()
     while time.monotonic() - t0 < 30:
