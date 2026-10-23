@@ -57,7 +57,7 @@ tray_app.py         托盘常驻（纯 Win32 SetTimer + NOTIFYICONDATAW，图标
   和面板卡片都由 `PROFILES` 生成，不需要动 UI 代码。
 - **读不到电量返回 `None` 并缓存上一次的值，绝不填充猜测的数字**；缓存过期就如实报错。
 - 支撑模块：`tray_common.py`（配置 / 单实例 PID / 自启 .lnk / 桌面链接 / 僵尸进程清理）、
-  `win_icon.py`（运行时用 GDI 画数字图标）、`win_link.py`（符号链接/junction/硬链接）、
+  `win_icon.py`（运行时画「设备剪影 + 电池条」托盘图标）、`win_link.py`（符号链接/junction/硬链接）、
   `win_shell.py`（纯 ctypes 创建 .lnk）。
 - **上游 fork 遗留、不在当前读取链路里**：`app.py`（完整调试 GUI）、`battery.py`（通用多策略框架）、
   `darkrim_proto.py`、`bt_battery.py`。`tray_app.py` 仍 import 了 `battery`/`darkrim_proto` 但未使用。

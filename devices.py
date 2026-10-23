@@ -48,6 +48,7 @@ class DeviceProfile:
     title: str
     reader: Callable[[], Reading]
     note: str = ""
+    kind: str = "mouse"      # 托盘图标画哪种剪影：headset / mouse / keyboard
 
 
 # --------------------------------------------------------------------------
@@ -137,11 +138,11 @@ def _cached(key: str, fn: Callable[[], Reading]) -> Callable[[], Reading]:
 # --------------------------------------------------------------------------
 PROFILES: list[DeviceProfile] = [
     DeviceProfile("edifier", "漫步者 G3 Max", _cached("edifier", read_edifier),
-                  note="杰理方案；协议来自 HECATE 官方软件日志"),
+                  note="杰理方案；协议来自 HECATE 官方软件日志", kind="headset"),
     DeviceProfile("rapoo", "雷柏 VT3S", _cached("rapoo", read_rapoo),
-                  note="VID 24AE；被动状态帧"),
+                  note="VID 24AE；被动状态帧", kind="mouse"),
     DeviceProfile("mchose", "迈从 K87S", _cached("mchose", read_mchose),
-                  note="VID 3837；固件推送式"),
+                  note="VID 3837；固件推送式", kind="keyboard"),
 ]
 
 

@@ -173,8 +173,8 @@ KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
                                   wintypes.LPCWSTR]
 
 TRAY_ICONS = [
-    # (uID, key, 提示名) —— 由 devices.PROFILES 自动生成
-    (i + 1, p.key, p.title)
+    # (uID, key, 提示名, 剪影类型) —— 由 devices.PROFILES 自动生成
+    (i + 1, p.key, p.title, p.kind)
     for i, p in enumerate(devices.PROFILES)
 ]
 
@@ -206,7 +206,8 @@ class TrayApp:
         self.hwnd: Optional[int] = None
         self.wndproc_ref = None
         self.busy = False
-        self.levels = {k: devices.Reading("", error="正在读取…") for _, k, _ in TRAY_ICONS}
+        self.levels = {k: devices.Reading("", error="正在读取…")
+                       for _, k, _, _ in TRAY_ICONS}
         self.icons_added = False
         self.taskbar_created_msg = USER32.RegisterWindowMessageW("TaskbarCreated")
         self.msg_quit = USER32.RegisterWindowMessageW(tc.MSG_QUIT)
@@ -224,16 +225,6 @@ class TrayApp:
             print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
     # ---- 图标 ----------------------------------------------------------
-    @staticmethod
-    def _color(level: Optional[int]) -> tuple[int, int, int]:
-        if level is None:
-            return (150, 155, 160)
-        if level >= 60:
-            return (93, 220, 138)
-        if level >= 30:
-            return (245, 196, 81)
-        return (255, 107, 107)
-
     def _nid(self, uID: int):
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
@@ -243,12 +234,12 @@ class TrayApp:
         nid.uCallbackMessage = MSG_TRAY_CALLBACK
         return nid
 
-    def _apply_icon(self, action: int, uID: int, key: str, title: str) -> bool:
+    def _apply_icon(self, action: int, uID: int, key: str, title: str,
+                    kind: str) -> bool:
         r = self.levels[key]
         level = r.level
-        text = str(level) if level is not None else "--"
         nid = self._nid(uID)
-        nid.hIcon = win_icon.make_hicon(text, self._color(level))
+        nid.hIcon = win_icon.make_icon(kind, level)
         if level is not None:
             # 显示"数据是什么时候的"，不是"刚才刷新过"
             when = (last_state.stamp(r.ts) if r.ts
@@ -259,8 +250,8 @@ class TrayApp:
         return bool(SHELL32.Shell_NotifyIconW(action, ctypes.byref(nid)))
 
     def add_icons(self) -> None:
-        for uID, key, title in TRAY_ICONS:
-            ok = self._apply_icon(NIM_ADD, uID, key, title)
+        for uID, key, title, kind in TRAY_ICONS:
+            ok = self._apply_icon(NIM_ADD, uID, key, title, kind)
             self.log(f"NIM_ADD {title} -> {'ok' if ok else '失败'}")
         self.icons_added = True
 
@@ -268,11 +259,11 @@ class TrayApp:
         if not self.icons_added:
             self.add_icons()
             return
-        for uID, key, title in TRAY_ICONS:
-            self._apply_icon(NIM_MODIFY, uID, key, title)
+        for uID, key, title, kind in TRAY_ICONS:
+            self._apply_icon(NIM_MODIFY, uID, key, title, kind)
 
     def remove_icons(self) -> None:
-        for uID, _, _ in TRAY_ICONS:
+        for uID, _, _, _ in TRAY_ICONS:
             nid = self._nid(uID)
             nid.uFlags = 0
             SHELL32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
