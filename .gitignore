@@ -26,3 +26,6 @@ dist/
 .idea/
 Thumbs.db
 desktop.ini
+
+# CodeBuddy 本地设置
+.codebuddy/
